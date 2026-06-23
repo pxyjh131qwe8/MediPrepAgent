@@ -1,0 +1,24 @@
+# ==================== Web 框架 ====================
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
+# ==================== 配置管理 ====================
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# ==================== 数据库 ====================
+sqlalchemy[asyncio]>=2.0.30
+aiosqlite>=0.20.0
+
+# ==================== 后续阶段依赖（预声明） ====================
+# chromadb>=0.5.0           # 向量数据库
+# redis>=5.0.0              # Redis 客户端
+# openai>=1.30.0            # LLM API
+# langchain>=0.2.0          # LLM 编排框架
+
+# ==================== Agent Checkpoint 持久化 ====================
+langgraph-checkpoint-postgres  # LangGraph PostgreSQL checkpointer
+psycopg[binary]                 # PostgreSQL 异步驱动（v3）
+
+# ==================== 开发工具 ====================
+httpx>=0.27.0               # 测试用 HTTP 客户端（替代 requests）
