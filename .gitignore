@@ -19,7 +19,13 @@ venv/
 # 数据库
 *.db
 *.sqlite3
-data/chroma_db/
+
+# ChromaDB 向量数据（运行时生成）
+**/data/chroma_db/
+
+# RAG 数据文件（运行时生成 / 用户上传）
+**/data/rag_chunks.jsonl
+**/data/uploads/
 
 # OS
 .DS_Store
