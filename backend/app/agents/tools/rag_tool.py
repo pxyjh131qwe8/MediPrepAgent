@@ -1,104 +1,54 @@
-# # app/agents/tools/rag_tool.py
+"""
+LangChain RAG 检索工具 — Agent 自主调用，实现真正的 Function Calling。
+"""
 
-# from app.rag.retriever import MedicalRetriever
-
-
-# class MedicalRAGTool:
-#     """
-#     Agent 使用的医疗知识检索工具。
-#     """
-
-#     def __init__(self):
-#         self.retriever = MedicalRetriever()
-
-#     def search_medical_knowledge(
-#         self,
-#         query: str,
-#         top_k: int = 5,
-#     ) -> tuple[list[str], list[str]]:
-#         """
-#         返回：
-#         contexts: 给 Agent 使用的上下文文本
-#         references: 给前端展示的来源
-#         """
-
-#         results = self.retriever.retrieve(
-#             query=query,
-#             top_k=top_k,
-#         )
-
-#         contexts = []
-#         references = []
-
-#         for item in results:
-#             contexts.append(
-#                 f"【来源：{item.title}】\n{item.content}"
-#             )
-
-#             if item.title and item.title not in references:
-#                 references.append(item.title)
-
-#         return contexts, references
-
-# app/agents/tools/rag_tool.py
+from langchain_core.tools import tool
 
 from app.rag.hybrid_retriever import HybridMedicalRetriever
 
+# 模块级单例，避免每次 tool 调用都重建 retriever
+_retriever = HybridMedicalRetriever()
 
-class MedicalRAGTool:
+
+def _format_context(item) -> str:
+    """将单条检索结果格式化为 LLM 可读文本"""
+    metadata = item.metadata or {}
+
+    title = (
+        metadata.get("title")
+        or metadata.get("original_file_name")
+        or metadata.get("file_name")
+        or metadata.get("source")
+        or "未知来源"
+    )
+    page = metadata.get("page")
+    ref = f"{title}"
+    if page:
+        ref += f" 第{page}页"
+
+    return (
+        f"【来源：{ref}】\n"
+        f"相关性得分：{item.hybrid_score:.4f}\n"
+        f"{item.content}"
+    )
+
+
+@tool
+def rag_search(query: str) -> str:
+    """搜索医学知识库。
+
+    当你需要查找与用户症状相关的医学知识、科室信息、就诊建议时，调用此工具。
+    传入一个中文查询词（如症状名称或医学问题），返回最相关的医学资料。
+
+    参数：
+        query: 中文检索词，例如 "头痛的原因和就诊建议"、"胸痛需要挂什么科"
+    返回：
+        格式化的医学参考资料文本，含来源标注。
     """
-    Agent 使用的医疗知识检索工具。
+    results = _retriever.retrieve(query=query, final_top_k=5)
+    if not results:
+        return "未找到相关医学资料，请基于你的医学常识为用户提供谨慎建议。"
 
-    当前版本：
-    Chroma 向量检索 + BM25 关键词检索 + DashScope rerank
-    """
-
-    def __init__(self):
-        self.retriever = HybridMedicalRetriever()
-
-    def search_medical_knowledge(
-        self,
-        query: str,
-        top_k: int = 5,
-    ) -> tuple[list[str], list[str]]:
-
-        results = self.retriever.retrieve(
-            query=query,
-            final_top_k=top_k,
-        )
-
-        contexts: list[str] = []
-        references: list[str] = []
-
-        for item in results:
-            metadata = item.metadata or {}
-
-            title = (
-                metadata.get("title")
-                or metadata.get("original_file_name")
-                or metadata.get("file_name")
-                or metadata.get("source")
-                or "unknown"
-            )
-
-            page = metadata.get("page")
-
-            ref = f"{title}"
-            if page:
-                ref += f":page-{page}"
-
-            contexts.append(
-                f"""【来源：{ref}】
-【vector_score】：{item.vector_score:.4f}
-【bm25_score】：{item.bm25_score:.4f}
-【hybrid_score】：{item.hybrid_score:.4f}
-【rerank_score】：{item.rerank_score:.4f}
-
-{item.content}
-"""
-            )
-
-            if ref not in references:
-                references.append(ref)
-
-        return contexts, references
+    return "\n\n---\n\n".join(
+        _format_context(item) for item in results
+    )

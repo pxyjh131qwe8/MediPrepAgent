@@ -11,9 +11,11 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langchain_core.tools import tool
+from langchain_core.messages import ToolMessage
 from pydantic import BaseModel, Field
 
 from app.config import settings
+from app.agents.tools.rag_tool import rag_search
 from app.models.schemas import (
     HealthConsultRequest,
     RiskResult,
@@ -40,12 +42,10 @@ class HealthAgentOutput(BaseModel):
     department_result: DepartmentResult
     pre_visit_checklist: List[str] = Field(default_factory=list)
     lifestyle_advice: List[str] = Field(default_factory=list)
+    references: List[str] = Field(default_factory=list)
 
 class HealthAgentInput(BaseModel):
     user_request: HealthConsultRequest
-    # risk_result: RiskResult
-    # department_result: DepartmentResult
-    rag_context: List[str] = Field(default_factory=list)
 
 
 @tool
@@ -82,12 +82,17 @@ class HealthAgent:
 3. 根据用户描述判断风险等级 LOW / MEDIUM / HIGH。
 4. 结合 RAG 检索资料生成就诊准备建议。
 
+工作流程：
+- 收到用户症状后，请先调用 rag_search 工具检索医学知识库。
+- 如果用户描述了多种症状或复杂情况，可以多次调用 rag_search 分别检索。
+- 综合检索结果，按照下方 JSON 格式输出。
+
 重要安全规则：
 1. 你不能做疾病确诊。
 2. 你不能替代医生诊疗。
 3. 你不能推荐处方药、剂量或具体治疗方案。
 4. 你只能做健康科普、风险提示、科室导航和就诊准备。
-5. 如果用户明确否认某症状，例如“没有胸痛”“无呼吸困难”“否认肢体无力”，不得把这些否认的症状当作阳性高危信号。
+5. 如果用户明确否认某症状，例如"没有胸痛""无呼吸困难""否认肢体无力"，不得把这些否认的症状当作阳性高危信号。
 6. 只有用户明确描述存在高危症状时，才可以判断为 HIGH。
 7. 如果用户描述的是头痛、失眠、压力大，但明确没有胸痛、呼吸困难、肢体无力、意识模糊，一般不应判断为 HIGH。
 8. 如果风险不确定，优先给出 MEDIUM 或 LOW，并建议线下医生评估。
@@ -113,7 +118,8 @@ class HealthAgent:
     "reason": "..."
   },
   "pre_visit_checklist": ["...", "..."],
-  "lifestyle_advice": ["...", "..."]
+  "lifestyle_advice": ["...", "..."],
+  "references": ["来源文件名1", "来源文件名2"]
 }
 """
 
@@ -130,7 +136,7 @@ class HealthAgent:
 
         self.agent = create_agent(
             model=settings.LLM_MODEL,
-            tools=[medical_safety_rule_tool],
+            tools=[medical_safety_rule_tool, rag_search],
             system_prompt=self.SYSTEM_PROMPT,
             checkpointer=self.checkpointer,
             middleware=[self.middleware],
@@ -144,17 +150,15 @@ class HealthAgent:
         失败时保留 InMemorySaver 降级运行，不会阻断服务启动。
         """
         try:
-            # from_conn_string 返回异步上下文管理器，需要进入后才拿到实例
             self._pg_context = AsyncPostgresSaver.from_conn_string(
                 settings.CHECKPOINT_DATABASE_URL
             )
             pg_checkpointer = await self._pg_context.__aenter__()
             await pg_checkpointer.setup()
             self.checkpointer = pg_checkpointer
-            # 用 PostgreSQL checkpointer 重建 agent
             self.agent = create_agent(
                 model=settings.LLM_MODEL,
-                tools=[medical_safety_rule_tool],
+                tools=[medical_safety_rule_tool, rag_search],
                 system_prompt=self.SYSTEM_PROMPT,
                 checkpointer=self.checkpointer,
                 middleware=[self.middleware],
@@ -175,13 +179,16 @@ class HealthAgent:
                 print("[HealthAgent] ✅ PostgreSQL checkpointer 连接池已释放")
             except Exception as exc:
                 print(f"[HealthAgent] ⚠️ 关闭 checkpointer 时出错: {exc}")
-    
+
     async def generate(self,
                        agent_input: HealthAgentInput,
                        thread_id: str | None = None
-    ) -> HealthAgentOutput:  
+    ) -> HealthAgentOutput:
         """
         调用 LangChain Agent 生成健康建议。
+
+        Agent 会自主决定是否调用 rag_search 检索医学知识库，
+        不再依赖外部预检索注入。
         """
         final_thread_id = thread_id or agent_input.user_request.thread_id or "default-health-thread"
 
@@ -190,11 +197,10 @@ class HealthAgent:
                 "thread_id": final_thread_id
             }
         }
-        
+
         user_prompt = self._build_user_prompt(agent_input)
-        
-        try: 
-            # 调用 Agent
+
+        try:
             result = await self.agent.ainvoke(
                 {
                     "messages": [
@@ -203,23 +209,27 @@ class HealthAgent:
                 },
                 config=config
             )
-            # 解析输出
             raw_text = self._extract_final_text(result)
-            return self._parse_json_output(raw_text, agent_input)
+            parsed = self._parse_json_output(raw_text, agent_input)
+
+            # 从 Agent 的 ToolMessage 中提取 rag_search 的来源引用
+            # 如果 Agent 已经在 JSON 中提供了 references 则优先使用
+            if not parsed.references:
+                parsed.references = self._extract_references_from_messages(
+                    result.get("messages", [])
+                )
+
+            return parsed
         except Exception as exc:
             print(f"[HealthAgent] Agent 调用失败，使用降级输出: {type(exc).__name__}: {exc}")
             return self._fallback_output(agent_input)
-    
-    # 构建用户提示语，包含所有输入信息和 RAG 资料
-    def _build_user_prompt(self, inp: HealthAgentInput) -> str:
-        req = inp.user_request
-        # risk = inp.risk_result
-        # dept = inp.department_result
 
-        rag_text = "\n".join(inp.rag_context) if inp.rag_context else "暂无 RAG 检索资料。"
+    def _build_user_prompt(self, inp: HealthAgentInput) -> str:
+        """构建用户提示语。Agent 会自主通过 rag_search 工具检索知识。"""
+        req = inp.user_request
 
         return f"""
-请根据以下信息生成健康科普和就诊准备建议。
+请根据以下用户信息，先调用 rag_search 工具检索相关医学知识，再生成健康科普和就诊准备建议。
 
 【用户基本信息】
 年龄：{req.age or "未知"}
@@ -243,23 +253,32 @@ class HealthAgent:
 【用户目标】
 {req.goal or "未提供"}
 
-
-【RAG 参考资料】
-{rag_text}
-
-
 请特别注意：
-1. 用户明确否认的症状，不能作为阳性症状。
-2. 不要因为文本中出现“没有胸痛”“无呼吸困难”就判断用户有胸痛或呼吸困难。
-3. 只能做就诊准备和健康科普，不能诊断。
-4. 科室推荐要说明理由。
-5. 输出合法 JSON。
-""" 
-    
+1. 先调用 rag_search 工具检索知识库再进行回答。
+2. 用户明确否认的症状，不能作为阳性症状。
+3. 不要因为文本中出现"没有胸痛""无呼吸困难"就判断用户有胸痛或呼吸困难。
+4. 只能做就诊准备和健康科普，不能诊断。
+5. 科室推荐要说明理由。
+6. 输出合法 JSON，在 references 字段中列出你实际参考的来源文件名。
+"""
+
+    def _extract_references_from_messages(self, messages: list) -> list[str]:
+        """从 ToolMessage 中提取 rag_search 返回的来源引用。"""
+        import re
+        references: list[str] = []
+        for msg in messages:
+            if isinstance(msg, ToolMessage) and msg.name == "rag_search":
+                content = msg.content or ""
+                # 匹配 rag_search 返回中的【来源：xxx】标记
+                found = re.findall(r"【来源：(.+?)】", content)
+                for ref in found:
+                    ref = ref.strip()
+                    if ref not in references:
+                        references.append(ref)
+        return references
+
     def _extract_final_text(self, result) -> str:
-        """
-        从 create_agent 返回结果中提取最后一条 AI 消息。
-        """
+        """从 create_agent 返回结果中提取最后一条 AI 消息。"""
         messages = result.get("messages", [])
         if not messages:
             return ""
@@ -283,9 +302,7 @@ class HealthAgent:
         raw_text: str,
         agent_input: HealthAgentInput,
     ) -> HealthAgentOutput:
-        """
-        解析 Agent JSON 输出。
-        """
+        """解析 Agent JSON 输出。"""
         text = raw_text.strip()
 
         if text.startswith("```"):
@@ -323,6 +340,7 @@ class HealthAgent:
                 ),
                 pre_visit_checklist=data.get("pre_visit_checklist", []),
                 lifestyle_advice=data.get("lifestyle_advice", []),
+                references=data.get("references", []),
             )
 
         except Exception as exc:
@@ -371,8 +389,8 @@ class HealthAgent:
                 "不要自行长期用药或随意加减药。",
                 "如果症状加重或出现新的危险信号，请及时线下就医。",
             ],
-        )       
-        
-        
+        )
+
+
 
 
