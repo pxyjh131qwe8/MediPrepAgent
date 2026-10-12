@@ -3,18 +3,10 @@ from typing import List
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from app.rag.hybrid_retriever import HybridMedicalRetriever
-from app.services.knowledge_service import KnowledgeService
-
-
 knowledge_router = APIRouter(
     prefix="/knowledge",
     tags=["knowledge"],
 )
-
-knowledge_service = KnowledgeService()
-hybrid_retriever = HybridMedicalRetriever()
-
 
 class KnowledgeSearchRequest(BaseModel):
     query: str
@@ -27,10 +19,16 @@ async def upload_knowledge_file(
     source_type: str = Form("uploaded_file"),
 ):
     try:
+        from app.services.knowledge_service import KnowledgeService
+
+        knowledge_service = KnowledgeService()
         return await knowledge_service.upload_and_ingest(
             file=file,
             source_type=source_type,
         )
+
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail="知识库增强依赖尚未安装，请安装 requirements-rag.txt") from exc
 
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -56,20 +54,24 @@ async def upload_knowledge_files_batch(
             detail="请至少上传一个文件",
         )
 
-    return await knowledge_service.upload_many_and_ingest(
-        files=files,
-        source_type=source_type,
-    )
+    try:
+        from app.services.knowledge_service import KnowledgeService
+
+        return await KnowledgeService().upload_many_and_ingest(files=files, source_type=source_type)
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail="知识库增强依赖尚未安装，请安装 requirements-rag.txt") from exc
 
 
 @knowledge_router.post("/search")
 async def search_knowledge(
     request: KnowledgeSearchRequest,
 ):
-    results = hybrid_retriever.retrieve(
-        query=request.query,
-        final_top_k=request.top_k,
-    )
+    try:
+        from app.rag.hybrid_retriever import HybridMedicalRetriever
+
+        results = HybridMedicalRetriever().retrieve(query=request.query, final_top_k=request.top_k)
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail="语义检索依赖尚未安装，请安装 requirements-rag.txt") from exc
 
     return {
         "query": request.query,

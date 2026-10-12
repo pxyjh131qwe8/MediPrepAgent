@@ -4,6 +4,7 @@
 
 from collections import defaultdict
 from app.models.schemas import DepartmentResult
+from app.services.risk_service import RiskService
 
 
 class DepartmentService:
@@ -49,7 +50,7 @@ class DepartmentService:
         
         # 寻找匹配的症状并累加科室分数
         for symptom, rule in self.DEPARTMENT_RULES.items():
-            if symptom in symptoms: 
+            if RiskService._present(symptoms, symptom):
                 matched_symptoms.append(symptom) 
                 for dept in rule["departments"]:
                     department_scores[dept] += rule["weight"]
@@ -58,8 +59,8 @@ class DepartmentService:
         if not department_scores: 
             return DepartmentResult(
                 primary_department="全科医学科",
-                alternative_departments=["全科医学科"],
-                reason="未匹配到特定症状，推荐全科医学科"
+                alternative_departments=[],
+                reason="目前信息还不足以指向单一专科，可以先由全科医学科或医院导诊台评估。"
             ) 
         
         # 根据分数排序推荐科室
@@ -82,7 +83,7 @@ class DepartmentService:
         return DepartmentResult(
             primary_department=primary,
             alternative_departments=alternatives,
-            reason=f"检测到症状: {', '.join(matched_symptoms)}"
+            reason=f"结合你提到的{'、'.join(matched_symptoms)}，这个科室更适合作为首诊入口。"
         )          
     
     

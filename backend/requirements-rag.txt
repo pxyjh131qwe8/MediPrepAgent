@@ -1,0 +1,14 @@
+-r requirements.txt
+
+# Optional semantic retrieval and file ingestion stack.
+# This downloads a local embedding model and may take several gigabytes.
+langchain-core>=0.3,<2.0
+langchain-text-splitters>=0.3,<2.0
+langchain-chroma>=0.2,<2.0
+langchain-huggingface>=0.1,<2.0
+chromadb>=0.5,<2.0
+sentence-transformers>=3.0,<6.0
+jieba>=0.42,<1.0
+rank-bm25>=0.2.2,<1.0
+pypdf>=5.0,<7.0
+python-docx>=1.1,<2.0

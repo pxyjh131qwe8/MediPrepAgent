@@ -1,21 +1,22 @@
-# 后端主编排层
-# 职责：接受用户请求 → 合并上下文 → 调用 Agent（Agent 自主检索 RAG）→ 保存上下文 → 返回结果
+"""Health consultation application service."""
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.schemas import HealthConsultRequest, HealthConsultResponse
+from app.agents.medical_team import MedicalTeam
 from app.services.health_context_service import HealthContextService
-from app.agents.health_agent import HealthAgent, HealthAgentInput
 
 
 class HealthService:
     """
     健康咨询主编排服务。
-    RAG 检索已移入 Agent 内部（Function Calling），编排层不再预检索。
+    Context persistence stays here; specialist collaboration lives in MedicalTeam.
     """
 
     def __init__(self):
-        self.health_agent = HealthAgent()
+        self.medical_team = MedicalTeam()
+        # Kept as a compatibility alias for the existing lifespan integration.
+        self.health_agent = self.medical_team.care_plan_agent
         self.context_service = HealthContextService()
 
     async def consult_health(
@@ -33,13 +34,10 @@ class HealthService:
                 request=request
             )
 
-        # 3. 调用 Agent（Agent 内部通过 Function Calling 自主检索 RAG）
-        agent_output = await self.health_agent.generate(
-            HealthAgentInput(
-                user_request=effective_request,
-            ),
-            thread_id=effective_request.thread_id,
-        )
+        # Triage and evidence retrieval run concurrently, followed by planning,
+        # safety review, and a narrow tone pass.
+        team_result = await self.medical_team.run(effective_request)
+        agent_output = team_result.output
 
         # 4. 咨询成功后，保存本次病情
         await self.context_service.save_from_consult_request(
@@ -55,7 +53,11 @@ class HealthService:
             pre_visit_checklist=agent_output.pre_visit_checklist,
             lifestyle_advice=agent_output.lifestyle_advice,
             references=agent_output.references,
-            disclaimer="本结果仅用于健康科普和就诊准备，不能替代医生诊断。如症状严重或持续加重，请及时线下就医。",
+            disclaimer="这份内容用于健康科普和就诊准备，不能代替医生面诊或诊断。身体感受如果明显加重，请及时线下就医。",
+            evidence=team_result.evidence,
+            follow_up_questions=team_result.follow_up_questions,
+            agent_trace=team_result.trace,
+            quality=team_result.quality,
         )
 
 

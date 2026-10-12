@@ -14,6 +14,12 @@ health_router = APIRouter(tags=["health"])
 
 health_service = HealthService()
 
+
+@health_router.get("/ping")
+async def ping_health_api():
+    """Lightweight readiness endpoint for the web client."""
+    return {"status": "ok", "service": "medical-team", "version": "0.2.0"}
+
 @health_router.post("/consult", response_model=HealthConsultResponse)
 async def consult_health_api(request: HealthConsultRequest, db: AsyncSession = Depends(get_database)):
     """健康咨询接口"""

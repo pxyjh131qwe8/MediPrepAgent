@@ -11,6 +11,9 @@ from pathlib import Path
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 
 
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+
+
 class Settings(BaseSettings):
     """
     应用全局配置
@@ -31,13 +34,13 @@ class Settings(BaseSettings):
 
     # ==================== 数据库 ====================
     DATABASE_URL: str = Field(
-        default="",
+        default=f"sqlite+aiosqlite:///{(BACKEND_DIR / 'data' / 'mediprep.db').as_posix()}",
         description="数据库连接字符串，例如 mysql+aiomysql://user:password@localhost:3306/mediprep_db?charset=utf8"
     )
 
     # ==================== ChromaDB 向量数据库 ====================
-    MEDICAL_DOCS_DIR: str = "data/medical_guides"
-    CHROMA_PERSIST_DIR: str = "data/chroma_db"
+    MEDICAL_DOCS_DIR: str = str(BACKEND_DIR / "data" / "medical_guides")
+    CHROMA_PERSIST_DIR: str = str(BACKEND_DIR / "data" / "chroma_db")
     CHROMA_COLLECTION_NAME: str = "medical_guides"
     # 本地中文 embedding 模型
     EMBEDDING_MODEL: str = "BAAI/bge-small-zh-v1.5"
@@ -61,11 +64,12 @@ class Settings(BaseSettings):
         default="deepseek-chat",
         description="默认使用的 LLM 模型名称"
     )
+    LLM_TIMEOUT_SECONDS: float = Field(default=45.0, ge=5.0, le=180.0)
     
     # ==================== RAG 文件上传与检索配置 ====================
-    UPLOAD_DOCS_DIR: str = "data/uploads/knowledge"
+    UPLOAD_DOCS_DIR: str = str(BACKEND_DIR / "data" / "uploads" / "knowledge")
 
-    RAG_CHUNKS_PATH: str = "data/rag_chunks.jsonl"
+    RAG_CHUNKS_PATH: str = str(BACKEND_DIR / "data" / "rag_chunks.jsonl")
 
     RAG_CHUNK_SIZE: int = 700
     RAG_CHUNK_OVERLAP: int = 120
@@ -105,7 +109,7 @@ class Settings(BaseSettings):
         Path(self.RAG_CHUNKS_PATH).parent.mkdir(parents=True, exist_ok=True)
 
     model_config = {
-        "env_file": ".env",           # 自动读取项目根目录的 .env
+        "env_file": str(BACKEND_DIR / ".env"),
         "env_file_encoding": "utf-8",
         "case_sensitive": True,       # 保持大写风格
     }
@@ -116,12 +120,11 @@ settings = Settings()
 
 
 # 建表函数（在应用启动时调用）
-async_engine = create_async_engine(
-    settings.DATABASE_URL,
-    echo=True,  # 打印SQL语句
-    pool_size=10,  # 连接池大小
-    max_overflow=20,  # 连接池最大溢出数量
-)
+engine_options = {"echo": settings.DEBUG}
+if not settings.DATABASE_URL.startswith("sqlite"):
+    engine_options.update({"pool_size": 10, "max_overflow": 20})
+
+async_engine = create_async_engine(settings.DATABASE_URL, **engine_options)
 
 # 全局异步数据库会话工厂，供依赖注入使用
 AsyncSessionLocal = async_sessionmaker(

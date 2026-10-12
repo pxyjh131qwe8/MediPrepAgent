@@ -1,38 +1,26 @@
+"""Care-plan specialist backed by an OpenAI-compatible chat endpoint.
+
+Urgency is decided before this agent runs and is never delegated to the model.
+The model's job is to turn verified evidence into a useful visit-preparation
+plan. Keeping that boundary explicit makes failures easier to audit.
+"""
+
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from typing import List, Optional
+from typing import List
 
-from langchain.agents import create_agent
-from langchain.agents.middleware import SummarizationMiddleware
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.runnables import RunnableConfig
-from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langchain_core.tools import tool
-from langchain_core.messages import ToolMessage
+import httpx
 from pydantic import BaseModel, Field
 
 from app.config import settings
-from app.agents.tools.rag_tool import rag_search
 from app.models.schemas import (
+    DepartmentResult,
+    EvidenceItem,
     HealthConsultRequest,
     RiskResult,
-    DepartmentResult,
 )
-
-
-# class RiskResult(BaseModel):
-#     risk_level: str = Field(description="LOW/MEDIUM/HIGH")
-#     warnings: List[str] = Field(default_factory=list) 
-#     action: str = ""
-    
-# class DepartmentResult(BaseModel):
-#     primary_department: str = ""
-#     alternative_departments: List[str] = Field(default_factory=list)
-#     reason: str = ""     
-
+from app.services.department_service import DepartmentService
 
 
 class HealthAgentOutput(BaseModel):
@@ -44,353 +32,163 @@ class HealthAgentOutput(BaseModel):
     lifestyle_advice: List[str] = Field(default_factory=list)
     references: List[str] = Field(default_factory=list)
 
+
 class HealthAgentInput(BaseModel):
     user_request: HealthConsultRequest
-
-
-@tool
-def medical_safety_rule_tool() -> str:
-    """返回医疗健康agent的安全边界""" 
-    return (
-        "你不能做疾病确诊，不能替代医生，不能推荐处方药，"
-        "不能给出具体治疗方案。你只能做健康科普、风险提醒、"
-        "科室建议解释和就诊准备。"
-    )
+    triage_result: RiskResult
+    evidence: List[EvidenceItem] = Field(default_factory=list)
 
 
 class HealthAgent:
-    """
-    基于 LangChain create_agent 的健康咨询 Agent。
+    """Synthesize a grounded, gentle visit-preparation plan."""
 
-    特点：
-    1. 使用 create_agent 构建正式 Agent
-    2. 使用 AsyncPostgresSaver（PostgreSQL）持久化对话历史，服务重启不丢失
-    3. 使用 SummarizationMiddleware 做长对话摘要
-    4. 使用 thread_id 区分不同用户/会话
-    5. 输出结构化 JSON
-
-    Checkpointer 初始化：
-    - 构造时先用 InMemorySaver 做降级兜底
-    - lifespan 中调用 setup_checkpointer() 升级为 PostgreSQL
-    """
     SYSTEM_PROMPT = """
-你是 MediPrepAgent，一个谨慎、专业的智能就诊准备助手。
+你是 MediPrepAgent 医疗协作组里的就诊规划专员。你的工作不是诊断，而是帮助用户更从容地准备就医。
 
-你的任务：
-1. 根据用户描述进行健康科普。
-2. 根据症状推荐可能适合咨询的科室。
-3. 根据用户描述判断风险等级 LOW / MEDIUM / HIGH。
-4. 结合 RAG 检索资料生成就诊准备建议。
+硬性边界：
+1. 不确诊，不暗示已经确诊，不替代医生，不开处方，不给药物剂量或具体治疗方案。
+2. 只使用输入中给出的用户事实和医学资料。资料没有覆盖的内容，要明确说“仅凭目前信息无法判断”。
+3. 可能相关因素只能用“可能与……有关”“医生通常会结合……排查”等非诊断表达。
+4. 上游分诊结果是确定性安全结论，不得降低风险等级，也不得删除其行动建议。
+5. 用户明确否认的症状绝不能当作阳性症状。
+6. 表达像一位认真、温和的医护人员：句子自然、具体，不说“作为AI”“根据大数据”“亲亲”等话。
+7. 不渲染焦虑。高风险时直接、清楚地说明下一步。
+8. 只输出合法 JSON，不输出 Markdown 或额外解释。
 
-工作流程：
-- 收到用户症状后，请先调用 rag_search 工具检索医学知识库。
-- 如果用户描述了多种症状或复杂情况，可以多次调用 rag_search 分别检索。
-- 综合检索结果，按照下方 JSON 格式输出。
-
-重要安全规则：
-1. 你不能做疾病确诊。
-2. 你不能替代医生诊疗。
-3. 你不能推荐处方药、剂量或具体治疗方案。
-4. 你只能做健康科普、风险提示、科室导航和就诊准备。
-5. 如果用户明确否认某症状，例如"没有胸痛""无呼吸困难""否认肢体无力"，不得把这些否认的症状当作阳性高危信号。
-6. 只有用户明确描述存在高危症状时，才可以判断为 HIGH。
-7. 如果用户描述的是头痛、失眠、压力大，但明确没有胸痛、呼吸困难、肢体无力、意识模糊，一般不应判断为 HIGH。
-8. 如果风险不确定，优先给出 MEDIUM 或 LOW，并建议线下医生评估。
-9. 输出必须是合法 JSON，不要输出 Markdown，不要输出代码块。
-
-风险等级参考：
-- HIGH：明确存在胸痛伴呼吸困难/大汗、意识模糊、昏迷、抽搐、突发肢体无力、说话不清、大量出血、呕血黑便伴明显不适等急症信号。
-- MEDIUM：症状持续较久、反复发作、明显影响生活，但暂无明确急症信号。
-- LOW：轻度、短期、暂无明显高危信号的症状。
-
-你必须输出如下 JSON：
+输出结构：
 {
-  "summary": "...",
-  "possible_causes": ["...", "..."],
-  "risk_result": {
-    "risk_level": "LOW/MEDIUM/HIGH",
-    "warnings": ["...", "..."],
-    "action": "..."
-  },
+  "summary": "两三句自然、温和的概括",
+  "possible_causes": ["可能相关的因素；资料不足时可为空"],
   "department_result": {
-    "primary_department": "...",
-    "alternative_departments": ["...", "..."],
-    "reason": "..."
+    "primary_department": "首选科室",
+    "alternative_departments": ["备选科室"],
+    "reason": "与症状和资料对应的理由"
   },
-  "pre_visit_checklist": ["...", "..."],
-  "lifestyle_advice": ["...", "..."],
-  "references": ["来源文件名1", "来源文件名2"]
+  "pre_visit_checklist": ["具体可执行的准备事项"],
+  "lifestyle_advice": ["低风险、保守的日常建议"]
 }
 """
 
-    def __init__(self):
-        # 先用 InMemorySaver 做降级兜底，lifespan 中会调用 setup_checkpointer()
-        # 升级为 AsyncPostgresSaver（PostgreSQL 持久化）
-        self.checkpointer: InMemorySaver | AsyncPostgresSaver = InMemorySaver()
-
-        self.middleware = SummarizationMiddleware(
-            model=settings.LLM_MODEL,
-            trigger=("messages", 6),
-            keep=("messages", 2),
-        )
-
-        self.agent = create_agent(
-            model=settings.LLM_MODEL,
-            tools=[medical_safety_rule_tool, rag_search],
-            system_prompt=self.SYSTEM_PROMPT,
-            checkpointer=self.checkpointer,
-            middleware=[self.middleware],
-        )
+    def __init__(self) -> None:
+        self.department_service = DepartmentService()
 
     async def setup_checkpointer(self) -> None:
-        """
-        由 FastAPI lifespan 调用，将 checkpointer 升级为 PostgreSQL 持久化。
-
-        调用时机：应用启动后、接收请求前。
-        失败时保留 InMemorySaver 降级运行，不会阻断服务启动。
-        """
-        try:
-            self._pg_context = AsyncPostgresSaver.from_conn_string(
-                settings.CHECKPOINT_DATABASE_URL
-            )
-            pg_checkpointer = await self._pg_context.__aenter__()
-            await pg_checkpointer.setup()
-            self.checkpointer = pg_checkpointer
-            self.agent = create_agent(
-                model=settings.LLM_MODEL,
-                tools=[medical_safety_rule_tool, rag_search],
-                system_prompt=self.SYSTEM_PROMPT,
-                checkpointer=self.checkpointer,
-                middleware=[self.middleware],
-            )
-            print("[HealthAgent] ✅ Checkpointer 已升级为 PostgreSQL 持久化")
-        except Exception as exc:
-            print(f"[HealthAgent] ⚠️ PostgreSQL checkpointer 初始化失败，降级为 InMemorySaver: {exc}")
-            print("[HealthAgent] ⚠️ 对话历史将在服务重启后丢失")
+        """Compatibility no-op; context is stored by HealthContextService."""
 
     async def teardown_checkpointer(self) -> None:
-        """
-        由 FastAPI lifespan 关闭阶段调用，释放 PostgreSQL 连接池。
-        """
-        ctx = getattr(self, "_pg_context", None)
-        if ctx is not None:
-            try:
-                await ctx.__aexit__(None, None, None)
-                print("[HealthAgent] ✅ PostgreSQL checkpointer 连接池已释放")
-            except Exception as exc:
-                print(f"[HealthAgent] ⚠️ 关闭 checkpointer 时出错: {exc}")
+        """Compatibility no-op."""
 
-    async def generate(self,
-                       agent_input: HealthAgentInput,
-                       thread_id: str | None = None
+    async def generate(
+        self,
+        agent_input: HealthAgentInput,
+        thread_id: str | None = None,
     ) -> HealthAgentOutput:
-        """
-        调用 LangChain Agent 生成健康建议。
-
-        Agent 会自主决定是否调用 rag_search 检索医学知识库，
-        不再依赖外部预检索注入。
-        """
-        final_thread_id = thread_id or agent_input.user_request.thread_id or "default-health-thread"
-
-        config: RunnableConfig = {
-            "configurable": {
-                "thread_id": final_thread_id
-            }
-        }
-
-        user_prompt = self._build_user_prompt(agent_input)
+        if not settings.LLM_API_KEY:
+            return self._fallback_output(agent_input)
 
         try:
-            result = await self.agent.ainvoke(
-                {
-                    "messages": [
-                        HumanMessage(content=user_prompt)
-                    ]
-                },
-                config=config
-            )
-            raw_text = self._extract_final_text(result)
-            parsed = self._parse_json_output(raw_text, agent_input)
-
-            # 从 Agent 的 ToolMessage 中提取 rag_search 的来源引用
-            # 如果 Agent 已经在 JSON 中提供了 references 则优先使用
-            if not parsed.references:
-                parsed.references = self._extract_references_from_messages(
-                    result.get("messages", [])
+            async with httpx.AsyncClient(timeout=settings.LLM_TIMEOUT_SECONDS) as client:
+                response = await client.post(
+                    f"{settings.LLM_BASE_URL.rstrip('/')}/chat/completions",
+                    headers={"Authorization": f"Bearer {settings.LLM_API_KEY}"},
+                    json={
+                        "model": settings.LLM_MODEL,
+                        "temperature": 0.2,
+                        "response_format": {"type": "json_object"},
+                        "messages": [
+                            {"role": "system", "content": self.SYSTEM_PROMPT},
+                            {"role": "user", "content": self._build_user_prompt(agent_input)},
+                        ],
+                    },
                 )
-
-            return parsed
+                response.raise_for_status()
+                content = response.json()["choices"][0]["message"]["content"]
+            return self._parse_json_output(content, agent_input)
         except Exception as exc:
-            print(f"[HealthAgent] Agent 调用失败，使用降级输出: {type(exc).__name__}: {exc}")
+            print(f"[CarePlanAgent] 模型调用失败，使用保守降级结果: {type(exc).__name__}: {exc}")
             return self._fallback_output(agent_input)
 
     def _build_user_prompt(self, inp: HealthAgentInput) -> str:
-        """构建用户提示语。Agent 会自主通过 rag_search 工具检索知识。"""
         req = inp.user_request
+        return json.dumps(
+            {
+                "用户信息": {
+                    "年龄": req.age,
+                    "性别": req.gender,
+                    "症状": req.symptoms,
+                    "持续时间": req.duration,
+                    "既往病史": req.medical_history,
+                    "用药史": req.medication_history,
+                    "过敏史": req.allergy_history,
+                    "这次最想解决": req.goal,
+                },
+                "确定性分诊结果_不得降低": inp.triage_result.model_dump(),
+                "已检索医学资料_只可引用这些事实": [item.model_dump() for item in inp.evidence],
+            },
+            ensure_ascii=False,
+        )
 
-        return f"""
-请根据以下用户信息，先调用 rag_search 工具检索相关医学知识，再生成健康科普和就诊准备建议。
-
-【用户基本信息】
-年龄：{req.age or "未知"}
-性别：{req.gender or "未知"}
-
-【用户症状】
-{req.symptoms}
-
-【持续时间】
-{req.duration or "未提供"}
-
-【既往病史】
-{req.medical_history or "未提供"}
-
-【用药史】
-{req.medication_history or "未提供"}
-
-【过敏史】
-{req.allergy_history or "未提供"}
-
-【用户目标】
-{req.goal or "未提供"}
-
-请特别注意：
-1. 先调用 rag_search 工具检索知识库再进行回答。
-2. 用户明确否认的症状，不能作为阳性症状。
-3. 不要因为文本中出现"没有胸痛""无呼吸困难"就判断用户有胸痛或呼吸困难。
-4. 只能做就诊准备和健康科普，不能诊断。
-5. 科室推荐要说明理由。
-6. 输出合法 JSON，在 references 字段中列出你实际参考的来源文件名。
-"""
-
-    def _extract_references_from_messages(self, messages: list) -> list[str]:
-        """从 ToolMessage 中提取 rag_search 返回的来源引用。"""
-        import re
-        references: list[str] = []
-        for msg in messages:
-            if isinstance(msg, ToolMessage) and msg.name == "rag_search":
-                content = msg.content or ""
-                # 匹配 rag_search 返回中的【来源：xxx】标记
-                found = re.findall(r"【来源：(.+?)】", content)
-                for ref in found:
-                    ref = ref.strip()
-                    if ref not in references:
-                        references.append(ref)
-        return references
-
-    def _extract_final_text(self, result) -> str:
-        """从 create_agent 返回结果中提取最后一条 AI 消息。"""
-        messages = result.get("messages", [])
-        if not messages:
-            return ""
-
-        last_message = messages[-1]
-        content = getattr(last_message, "content", "")
-
-        if isinstance(content, str):
-            return content
-
-        if isinstance(content, list):
-            return "".join(
-                item.get("text", "") if isinstance(item, dict) else str(item)
-                for item in content
-            )
-
-        return str(content)
-
-    def _parse_json_output(
-        self,
-        raw_text: str,
-        agent_input: HealthAgentInput,
-    ) -> HealthAgentOutput:
-        """解析 Agent JSON 输出。"""
+    def _parse_json_output(self, raw_text: str, inp: HealthAgentInput) -> HealthAgentOutput:
         text = raw_text.strip()
-
         if text.startswith("```"):
-            lines = text.splitlines()
-            if lines and lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            text = "\n".join(lines).strip()
-
-        start = text.find("{")
-        end = text.rfind("}")
-
-        if start != -1 and end != -1 and end > start:
+            text = "\n".join(text.splitlines()[1:-1]).strip()
+        start, end = text.find("{"), text.rfind("}")
+        if start >= 0 and end > start:
             text = text[start:end + 1]
 
         try:
             data = json.loads(text)
-
-            risk_data = data.get("risk_result") or {}
-            department_data = data.get("department_result") or {}
-
+            department = data.get("department_result") or {}
+            references = list(dict.fromkeys(item.source for item in inp.evidence))
             return HealthAgentOutput(
-                summary=data.get("summary", ""),
-                possible_causes=data.get("possible_causes", []),
-                risk_result=RiskResult(
-                    risk_level=risk_data.get("risk_level", "MEDIUM"),
-                    warnings=risk_data.get("warnings", []),
-                    action=risk_data.get("action", "建议根据症状持续情况，线下就医评估。"),
-                ),
+                summary=str(data.get("summary") or "").strip(),
+                possible_causes=[str(item) for item in data.get("possible_causes", [])][:6],
+                risk_result=inp.triage_result,
                 department_result=DepartmentResult(
-                    primary_department=department_data.get("primary_department", "人工导诊台"),
-                    alternative_departments=department_data.get("alternative_departments", []),
-                    reason=department_data.get("reason", "根据用户描述，建议先进行线下医学评估。"),
+                    primary_department=str(department.get("primary_department") or "全科医学科"),
+                    alternative_departments=[str(item) for item in department.get("alternative_departments", [])][:4],
+                    reason=str(department.get("reason") or "可先由医生结合问诊和检查判断下一步。"),
                 ),
-                pre_visit_checklist=data.get("pre_visit_checklist", []),
-                lifestyle_advice=data.get("lifestyle_advice", []),
-                references=data.get("references", []),
+                pre_visit_checklist=[str(item) for item in data.get("pre_visit_checklist", [])][:8],
+                lifestyle_advice=[str(item) for item in data.get("lifestyle_advice", [])][:6],
+                references=references,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return self._fallback_output(inp)
+
+    def _fallback_output(self, inp: HealthAgentInput) -> HealthAgentOutput:
+        req = inp.user_request
+        department = self.department_service.recommend_department(req.symptoms)
+        if inp.triage_result.risk_level == "HIGH":
+            department = DepartmentResult(
+                primary_department="急诊科",
+                alternative_departments=[],
+                reason="目前描述中有需要尽快排查的危险信号，先由急诊评估更稳妥。",
             )
 
-        except Exception as exc:
-            print("[HealthAgent] JSON 解析失败，使用降级输出")
-            print(f"[HealthAgent] 错误类型: {type(exc).__name__}")
-            print(f"[HealthAgent] 错误详情: {exc}")
-            print(f"[HealthAgent] 清洗后文本: {text[:1000]}")
-            print(f"[HealthAgent] 原始输出: {raw_text[:1000]}")
-            return self._fallback_output(agent_input)
-
-    def _fallback_output(
-        self,
-        inp: HealthAgentInput,
-    ) -> HealthAgentOutput:
-        symptoms = inp.user_request.symptoms
-
+        evidence_sources = list(dict.fromkeys(item.source for item in inp.evidence))
+        possible_factors = (
+            ["仅凭目前描述还不能判断具体原因，需要医生结合问诊、体格检查和必要检查进一步排查。"]
+            if not inp.evidence
+            else ["目前表现可能与多种常见因素有关，具体原因仍需医生结合面诊判断。"]
+        )
         return HealthAgentOutput(
             summary=(
-                f"根据你描述的症状「{symptoms}」，系统已完成初步就诊准备整理。"
-                "目前无法替代医生判断，建议结合线下医生问诊和检查进一步评估。"
+                f"我记下了你提到的“{req.symptoms}”。先别急着给它下结论，"
+                "更重要的是确认是否有需要尽快处理的信号，并把就诊信息准备完整。"
             ),
-            risk_result=RiskResult(
-                risk_level="MEDIUM",
-                warnings=[
-                    "当前无法由系统做出诊断判断。",
-                    "如果症状持续加重，或出现胸痛、呼吸困难、意识异常、肢体无力等新发危险信号，请及时线下就医。",
-                ],
-                action="建议根据症状持续时间和影响程度，预约相关科室或全科医学科进行评估。",
-            ),
-            department_result=DepartmentResult(
-                primary_department="人工导诊台",
-                alternative_departments=["神经内科", "睡眠医学科", "精神心理科"],
-                reason="根据用户描述相关表现，可先由人工导诊台评估，再根据医生建议转诊相关专科。",
-            ),
-            possible_causes=[
-                "症状可能与多种因素相关，需要医生结合问诊、体格检查和必要检查综合判断。",
-                "当前建议仅作为健康科普和就诊准备，不能作为诊断依据。",
-            ],
+            possible_causes=possible_factors,
+            risk_result=inp.triage_result,
+            department_result=department,
             pre_visit_checklist=[
-                "记录症状出现时间、持续时间、加重或缓解因素。",
-                "记录是否伴随发热、胸痛、呼吸困难、意识异常等症状。",
-                "携带既往检查报告、用药记录和过敏史。",
+                "记录症状从什么时候开始、每次持续多久，以及最近是否变重。",
+                "记下可能的诱因、缓解方式和同时出现的其他不适。",
+                "带上既往检查报告，并整理正在使用的药物和过敏信息。",
+                "把最想问医生的两三个问题提前写下来。",
             ],
             lifestyle_advice=[
-                "保持规律作息，避免过度劳累。",
-                "不要自行长期用药或随意加减药。",
-                "如果症状加重或出现新的危险信号，请及时线下就医。",
+                "在明确原因前，先保证休息和正常饮水，避免勉强工作或剧烈运动。",
+                "不要因为这份建议自行开始、停用或调整处方药。",
             ],
+            references=evidence_sources,
         )
-
-
-
-

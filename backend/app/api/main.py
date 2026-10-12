@@ -12,9 +12,12 @@ FastAPI 应用入口 — 应用的"装配车间"
 """
 
 from contextlib import asynccontextmanager
+import logging
+from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 
 from app.config import settings, async_engine
@@ -64,26 +67,24 @@ async def lifespan(app: FastAPI):
     """
     # ===== 启动阶段 =====
     settings.ensure_directories()
-    print(f"✅ {settings.APP_NAME} v{settings.APP_VERSION} 启动中...")
-    print(f"   📄 数据库: {settings.DATABASE_URL}")
-    print(f"   🧠 ChromaDB: {settings.CHROMA_PERSIST_DIR}")
-    print(f"   🔴 Redis: {settings.REDIS_URL}")
-    print(f"   🤖 LLM 模型: {settings.LLM_MODEL}")
-    print(f"   💾 Checkpoint DB: {settings.CHECKPOINT_DATABASE_URL}")
+    print(f"[startup] {settings.APP_NAME} v{settings.APP_VERSION}")
+    print(f"[startup] database={settings.DATABASE_URL}")
+    print(f"[startup] chroma={settings.CHROMA_PERSIST_DIR}")
+    print(f"[startup] llm={settings.LLM_MODEL}")
 
     await create_tables()
 
     # 初始化 HealthAgent 的 PostgreSQL checkpointer
     from app.api.routes.health import health_service
-    await health_service.health_agent.setup_checkpointer()
+    await health_service.medical_team.setup()
 
     yield  # ← 这里是应用正式运行的阶段
 
     # ===== 关闭阶段 =====
-    print(f"🛑 {settings.APP_NAME} 正在关闭...")
+    print(f"[shutdown] {settings.APP_NAME}")
     # 释放 PostgreSQL checkpointer 连接池
     try:
-        await health_service.health_agent.teardown_checkpointer()
+        await health_service.medical_team.teardown()
     except Exception:
         pass
 
@@ -104,8 +105,8 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],            # 开发阶段允许所有来源
-    allow_credentials=True,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=False,
     allow_methods=["*"],            # 允许所有 HTTP 方法
     allow_headers=["*"],            # 允许所有请求头
 )
@@ -116,9 +117,10 @@ app.add_middleware(
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """兜底异常处理，防止未捕获异常返回 500 堆栈"""
+    logging.getLogger("mediprep").exception("Unhandled request error", exc_info=exc)
     return JSONResponse(
         status_code=500,
-        content={"detail": f"服务器内部错误: {str(exc)}"},
+        content={"detail": "服务暂时没有完成这次处理，请稍后再试。"},
     )
 
 
@@ -135,8 +137,8 @@ app.include_router(knowledge_router, prefix="/api")
 
 # ==================== 根路由（可选，方便快速验证） ====================
 
-@app.get("/", tags=["root"])
-async def root():
+@app.get("/api/meta", tags=["root"])
+async def app_meta():
     """根路由 — 快速确认服务在线"""
     return {
         "app": settings.APP_NAME,
@@ -144,3 +146,10 @@ async def root():
         "docs": "/docs",
         "health": "/health/ping",
     }
+
+
+# A production frontend build is served by the same process when available.
+# API routes are registered first, so this catch-all mount cannot shadow them.
+frontend_dist = Path(__file__).resolve().parents[3] / "frontend" / "dist"
+if frontend_dist.exists():
+    app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")
